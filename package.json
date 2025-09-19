@@ -1,0 +1,29 @@
+{
+  "name": "tony-rutas-capacitor",
+  "private": true,
+  "version": "0.1.1",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "cap:add:android": "npx cap add android",
+    "cap:sync:android": "npx cap sync android",
+    "build:android": "npm run build && npx cap sync android && cd android && ./gradlew assembleDebug"
+  },
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "html5-qrcode": "^2.3.10",
+    "qrcode.react": "^3.1.0",
+    "uuid": "^9.0.1",
+    "lucide-react": "^0.460.0",
+    "@capacitor/android": "^6.1.0",
+    "@capacitor/core": "^6.1.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.1",
+    "vite": "^5.4.0",
+    "@capacitor/cli": "^6.1.0"
+  }
+}
