@@ -37,12 +37,13 @@ const twoOpt=(route,start)=>{
   return pts.slice(1)
 }
 async function geocodeAddress(q){
-  const url=`https://nominatim.openstreetmap.org/search?format=jsonv2&q=${encodeURIComponent(q)}`
-  const res=await fetch(url,{headers:{'Accept':'application/json'}})
-  if(!res.ok) throw new Error('Error geocoding')
-  const data=await res.json()
-  if(!Array.isArray(data)||data.length===0) throw new Error('Sin resultados')
-  const hit=data[0]; return { lat: parseFloat(hit.lat), lon: parseFloat(hit.lon), displayName: hit.display_name }
+  const url = 'https://nominatim.openstreetmap.org/search?format=jsonv2&q=' + encodeURIComponent(q);
+  const res = await fetch(url, { headers: { 'Accept': 'application/json' } });
+  if (!res.ok) throw new Error('Error geocoding');
+  const data = await res.json();
+  if (!Array.isArray(data) || data.length === 0) throw new Error('Sin resultados');
+  const hit = data[0];
+  return { lat: parseFloat(hit.lat), lon: parseFloat(hit.lon), displayName: hit.display_name };
 }
 function googleMapsDirLink(origin, stops){
   const originParam=`${origin.lat},${origin.lon}`
