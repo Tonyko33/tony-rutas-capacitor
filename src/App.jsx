@@ -162,15 +162,6 @@ const googleMapsDirLink=(origin,stops)=>{
   return `https://www.google.com/maps/dir/?api=1&origin=${encodeURIComponent(originParam)}&destination=${encodeURIComponent(destinationParam)}${wpParam}`
 }
 
-async function geocodeAddress(q){
-  const url=`https://nominatim.openstreetmap.org/search?format=jsonv2&q=${encodeURIComponent(q)}`
-  const res=await fetch(url,{headers:{'Accept':'application/json'}})
-  if(!res.ok) throw new Error('Error geocoding')
-  const data=await res.json()
-  if(!Array.isArray(data)||data.length===0) throw new Error('Sin resultados')
-  const hit=data[0]; return { lat: parseFloat(hit.lat), lon: parseFloat(hit.lon), displayName: hit.display_name }
-}
-
 function RoutePlanner({ items, onItemsUpdate }){
   const [origin,setOrigin]=useState({ lat:null, lon:null, label:'' })
   const [working,setWorking]=useState(false)
