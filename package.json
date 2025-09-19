@@ -12,18 +12,19 @@
     "build:android": "npm run build && npx cap sync android && cd android && ./gradlew assembleDebug"
   },
   "dependencies": {
+    "@capacitor/android": "^6.1.0",
+    "@capacitor/core": "^6.1.0",
+    "html5-qrcode": "^2.3.8",
+    "lucide-react": "^0.460.0",
+    "qrcode.react": "^3.1.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
-    "html5-qrcode": "^2.3.8",
-    "qrcode.react": "^3.1.0",
-    "uuid": "^9.0.1",
-    "lucide-react": "^0.460.0",
-    "@capacitor/android": "^6.1.0",
-    "@capacitor/core": "^6.1.0"
+    "uuid": "^9.0.1"
   },
   "devDependencies": {
+    "@capacitor/cli": "^6.1.0",
     "@vitejs/plugin-react": "^4.3.1",
-    "vite": "^5.4.0",
-    "@capacitor/cli": "^6.1.0"
+    "typescript": "^5.9.2",
+    "vite": "^5.4.0"
   }
 }
