@@ -1,15 +1,86 @@
-/* Optional helper styles if your project lacks them */
-.container{max-width:980px;margin:0 auto;padding:18px}
-.row{display:flex;align-items:center}
-.spacer{flex:1}
-.grid{display:grid;gap:14px}
-.grid-2{grid-template-columns:1fr}
-@media(min-width:900px){.grid-2{grid-template-columns:1.2fr .8fr}}
-.card{background:#1e1e1e;border:1px solid #333;border-radius:12px;padding:14px}
-.pill{font-size:12px;padding:6px 10px;border-radius:999px;background:#263238;color:#b3e5fc}
-.btn{border:none;border-radius:10px;padding:10px 14px;background:#1e88e5;color:#fff;cursor:pointer}
-.btn.ghost{background:transparent;border:1px solid #425a70;color:#d0e3ff}
-.btn.danger{background:#ef4444}
-.list{display:grid;gap:12px}
-.item{display:flex;gap:12px;background:#151515;border:1px solid #2a2a2a;padding:12px;border-radius:10px}
-.muted{color:#9aa5b1;font-size:12px}
+.grid {
+  display: grid;
+  gap: 14px;
+}
+
+.grid-2 {
+  grid-template-columns: 1fr;
+}
+
+@media (min-width: 900px) {
+  .grid-2 {
+    grid-template-columns: 1.2fr 0.8fr;
+  }
+}
+
+.card {
+  background: #1e1e1e;
+  border: 1px solid #333;
+  border-radius: 12px;
+  padding: 14px;
+}
+
+.pill {
+  font-size: 12px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: #262338;
+  color: #b3e5fc;
+}
+
+.btn {
+  border: none;
+  border-radius: 10px;
+  padding: 10px 14px;
+  background: #1e88e5;
+  color: #fff;
+  cursor: pointer;
+}
+
+.btn.ghost {
+  background: transparent;
+  border: 1px solid #425a70;
+  color: #d0e3ff;
+}
+
+.btn.danger {
+  background: #f44336;
+}
+
+.list {
+  display: grid;
+  gap: 12px;
+}
+
+.item {
+  display: flex;
+  gap: 12px;
+  background: #151515;
+  border: 1px solid #2a2a2a;
+  padding: 12px;
+  border-radius: 10px;
+}
+
+.muted {
+  color: #9aa5b1;
+  font-size: 12px;
+}
+
+button {
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid #ccc;
+  background: #f7f7f7;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: .6;
+  cursor: not-allowed;
+}
+
+input {
+  border: 1px solid #ccc;
+  border-radius: 8px;
+}
+
