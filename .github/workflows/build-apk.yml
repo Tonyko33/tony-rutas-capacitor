@@ -6,45 +6,51 @@ on:
       - main
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      - name: Install dependencies
-        run: npm install
+      - run: npm install
 
-      - name: Build web assets
-        run: npm run build
+      - run: npm run build
 
-      - name: Install Capacitor Android
-        run: npx cap add android
+      - run: npx cap add android || echo "Android ya está añadido"
 
-      - name: Sync web to Android
-        run: npx cap sync android
+      - run: npx cap sync android
 
-      - name: Setup JDK
-        uses: actions/setup-java@v3
+      - uses: actions/setup-java@v3
         with:
           distribution: temurin
           java-version: 17
 
-      - name: Build APK (debug)
-        run: |
+      - run: |
           cd android
           ./gradlew assembleDebug
 
-      - name: Upload APK to GitHub Release
-        uses: softprops/action-gh-release@v1
+      - uses: actions/upload-artifact@v4
         with:
-          files: android/app/build/outputs/apk/debug/app-debug.apk
+          name: app-debug
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          overwrite: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: "Build ${{ github.run_number }} – debug"
+          draft: false
+          prerelease: false
+          files: |
+            android/app/build/outputs/apk/debug/app-debug.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
