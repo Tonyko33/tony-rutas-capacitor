@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Tony Repartos</string>
+    <string name="title_activity_main">Tony Repartos</string>
+    <string name="package_name">com.tony.repartos</string>
+    <string name="custom_url_scheme">com.tony.repartos</string>
+</resources>
