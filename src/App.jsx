@@ -1,32 +1,19 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import Papa from "papaparse";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 
-/** ---------- Utils ---------- **/
-const LS_KEY = "tony-rutas:stops:v1";
-const LS_ORIGIN = "tony-rutas:origin:v1";
-
-const hav = (deg) => (deg * Math.PI) / 180;
-function haversine(a, b) {
-  const R = 6371; // km
-  const dLat = hav(b.lat - a.lat);
-  const dLon = hav(b.lon - a.lon);
-  const lat1 = hav(a.lat);
-  const lat2 = hav(b.lat);
-  const h =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
-  return 2 * R * Math.asin(Math.sqrt(h));
-}
+// ---------------- Utils ----------------
+const uid = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
 
 async function geocodeAddress(q) {
   const url =
-    "https://nominatim.openstreetmap.org/search?format=jsonv2&q=" +
+    "https://nominatim.openstreetmap.org/search?format=jsonv2&" +
+    "addressdetails=0&limit=1&q=" +
     encodeURIComponent(q);
-  const res = await fetch(url, { headers: { Accept: "application/json" } });
+  const res = await fetch(url, { headers: { "Accept": "application/json" } });
   if (!res.ok) throw new Error("Error geocoding");
   const data = await res.json();
-  if (!Array.isArray(data) || data.length === 0)
+  if (!Array.isArray(data) || data.length === 0) {
     throw new Error("Sin resultados");
+  }
   const hit = data[0];
   return {
     lat: parseFloat(hit.lat),
@@ -35,352 +22,349 @@ async function geocodeAddress(q) {
   };
 }
 
-/** ---------- Component ---------- **/
-export default function App() {
-  const [originText, setOriginText] = useState("");
-  const [origin, setOrigin] = useState(null); // {lat,lon,displayName}
-  const [name, setName] = useState("");
-  const [address, setAddress] = useState("");
-  const [stops, setStops] = useState([]); // {id,name,address,lat,lon,displayName}
-  const [busy, setBusy] = useState(false);
-  const [qrOpen, setQrOpen] = useState(false);
-  const qrRef = useRef(null);
-  const qrObj = useRef(null);
+function googleMapsDirLink(origin, stops) {
+  // Google Maps admite ~9 waypoints (origen + destino + 8 paradas)
+  const MAX_WP = 9;
+  const list = stops.slice(0, MAX_WP);
+  if (list.length === 0) return "#";
 
-  /** ---- Load/Save (persistencia) ---- **/
+  const originParam = origin ? `${origin.lat},${origin.lon}` : "";
+  const dest = list[list.length - 1];
+  const destParam = `${dest.lat},${dest.lon}`;
+  const waypoints = list.slice(0, -1).map(p => `${p.lat},${p.lon}`).join("|");
+  const wpParam = waypoints ? `&waypoints=${encodeURIComponent(waypoints)}` : "";
+
+  // https://www.google.com/maps/dir/?api=1&origin=..&destination=..&waypoints=..
+  return `https://www.google.com/maps/dir/?api=1&origin=${encodeURIComponent(originParam)}&destination=${encodeURIComponent(destParam)}${wpParam}`;
+}
+
+async function ensureCameraPermission() {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    throw new Error("Este dispositivo no soporta cámara");
+  }
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: "environment" },
+    audio: false,
+  });
+  // soltamos enseguida (solo queremos el permiso)
+  stream.getTracks().forEach(t => t.stop());
+}
+
+// -------------- App --------------------
+export default function App() {
+  // origen y paquetes (persisten)
+  const [origin, setOrigin] = useState(null);
+  const [packages, setPackages] = useState([]);
+
+  // formularios
+  const [search, setSearch] = useState("");
+  const [pkgName, setPkgName] = useState("");
+  const [pkgAddress, setPkgAddress] = useState("");
+  const [originAddress, setOriginAddress] = useState("");
+
+  // estados UI
+  const [loading, setLoading] = useState(false);
+  const [msg, setMsg] = useState("");
+
+  // QR
+  const [qrOpen, setQrOpen] = useState(false);
+  const qrRegionRef = useRef(null);
+  const html5QrRef = useRef(null);
+
+  // --- Persistencia ---
   useEffect(() => {
     try {
-      const raw = localStorage.getItem(LS_KEY);
-      if (raw) setStops(JSON.parse(raw));
-      const o = localStorage.getItem(LS_ORIGIN);
-      if (o) {
-        const parsed = JSON.parse(o);
-        setOrigin(parsed);
-        setOriginText(parsed.displayName || "");
+      const s = localStorage.getItem("tony.routes.data");
+      if (s) {
+        const parsed = JSON.parse(s);
+        if (parsed.origin) setOrigin(parsed.origin);
+        if (Array.isArray(parsed.packages)) setPackages(parsed.packages);
       }
     } catch {}
   }, []);
-  useEffect(() => {
-    try {
-      localStorage.setItem(LS_KEY, JSON.stringify(stops));
-    } catch {}
-  }, [stops]);
-  useEffect(() => {
-    try {
-      if (origin) localStorage.setItem(LS_ORIGIN, JSON.stringify(origin));
-    } catch {}
-  }, [origin]);
 
-  /** ---- Add / Remove ---- **/
-  async function setOriginFromText() {
-    if (!originText.trim()) return;
-    setBusy(true);
+  useEffect(() => {
+    const payload = JSON.stringify({ origin, packages });
+    localStorage.setItem("tony.routes.data", payload);
+  }, [origin, packages]);
+
+  // --- Búsqueda en memoria ---
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (!q) return packages;
+    return packages.filter(
+      (p) =>
+        (p.name || "").toLowerCase().includes(q) ||
+        (p.address || "").toLowerCase().includes(q) ||
+        (p.displayName || "").toLowerCase().includes(q)
+    );
+  }, [search, packages]);
+
+  // ------------- Acciones ---------------
+  async function setOriginByAddress() {
+    if (!originAddress.trim()) {
+      setMsg("Escribe una dirección para el origen.");
+      return;
+    }
+    setLoading(true);
+    setMsg("");
     try {
-      const g = await geocodeAddress(originText.trim());
-      setOrigin({ ...g, displayName: g.displayName });
-      alert("Origen definido ✔");
+      const hit = await geocodeAddress(originAddress.trim());
+      setOrigin({ ...hit, address: originAddress.trim() });
+      setOriginAddress(hit.displayName);
+      setMsg("Origen establecido ✅");
     } catch (e) {
-      alert("No se pudo geocodificar el origen: " + e.message);
+      setMsg("No pude localizar el origen. Añade ciudad/CP.");
     } finally {
-      setBusy(false);
+      setLoading(false);
     }
   }
 
-  async function addStop() {
-    if (!address.trim()) return;
-    setBusy(true);
+  async function addPackage() {
+    if (!pkgAddress.trim()) {
+      setMsg("Escribe la dirección.");
+      return;
+    }
+    setLoading(true);
+    setMsg("");
     try {
-      const g = await geocodeAddress(address.trim());
+      const hit = await geocodeAddress(pkgAddress.trim());
       const item = {
-        id: crypto.randomUUID(),
-        name: name.trim() || "Paquete",
-        address: address.trim(),
-        lat: g.lat,
-        lon: g.lon,
-        displayName: g.displayName,
+        id: uid(),
+        name: pkgName.trim() || "(Sin nombre)",
+        address: pkgAddress.trim(),
+        lat: hit.lat,
+        lon: hit.lon,
+        displayName: hit.displayName,
       };
-      setStops((x) => [...x, item]);
-      setName("");
-      setAddress("");
+      setPackages((prev) => [...prev, item]);
+      setPkgName("");
+      setPkgAddress("");
+      setMsg("Paquete añadido ✅");
     } catch (e) {
-      alert("Dirección no encontrada: " + e.message);
+      setMsg("No pude localizar esa dirección. Prueba con ciudad/CP.");
     } finally {
-      setBusy(false);
+      setLoading(false);
     }
   }
 
-  function removeStop(id) {
-    setStops((x) => x.filter((s) => s.id !== id));
+  function removePackage(id) {
+    setPackages((prev) => prev.filter((p) => p.id !== id));
   }
 
   function clearAll() {
-    if (confirm("¿Vaciar la lista?")) setStops([]);
+    if (!confirm("¿Vaciar todos los paquetes?")) return;
+    setPackages([]);
   }
 
-  /** ---- Optimización (heurística sencilla) ---- **/
-  function optimizeOrder() {
-    if (!origin || stops.length < 2) return;
-    // nearest neighbor desde origin
-    const remaining = [...stops];
-    const ordered = [];
-    let cur = { lat: origin.lat, lon: origin.lon };
-    while (remaining.length) {
-      let bestIdx = 0;
-      let bestD = Infinity;
-      for (let i = 0; i < remaining.length; i++) {
-        const d = haversine(cur, remaining[i]);
-        if (d < bestD) {
-          bestD = d;
-          bestIdx = i;
-        }
-      }
-      const [pick] = remaining.splice(bestIdx, 1);
-      ordered.push(pick);
-      cur = pick;
+  function openInGoogleMaps() {
+    if (!origin) {
+      alert("Primero define el origen.");
+      return;
     }
-    setStops(ordered);
-  }
-
-  const totalKm = useMemo(() => {
-    if (!origin || stops.length === 0) return 0;
-    let sum = haversine(origin, stops[0]);
-    for (let i = 0; i < stops.length - 1; i++) {
-      sum += haversine(stops[i], stops[i + 1]);
+    if (packages.length === 0) {
+      alert("Añade al menos una parada.");
+      return;
     }
-    return Math.round(sum * 10) / 10;
-  }, [origin, stops]);
-
-  /** ---- Abrir en Google Maps ---- **/
-  function googleMapsDirLink(o, list) {
-    if (!o || list.length === 0) return "#";
-    const originParam = `${o.lat},${o.lon}`;
-    const dest = list[list.length - 1];
-    const destParam = `${dest.lat},${dest.lon}`;
-    const via = list.slice(0, -1).map((p) => `${p.lat},${p.lon}`).join("|");
-    const wpParam = via ? `&waypoints=${encodeURIComponent(via)}` : "";
-    return `https://www.google.com/maps/dir/?api=1&origin=${encodeURIComponent(
-      originParam
-    )}&destination=${encodeURIComponent(destParam)}${wpParam}`;
-  }
-  function openMaps() {
-    const url = googleMapsDirLink(origin, stops);
-    if (url === "#") return;
+    const url = googleMapsDirLink(origin, packages);
     window.open(url, "_blank");
   }
 
-  /** ---- Exportar / Importar ---- **/
-  function exportCSV() {
-    const rows = stops.map((s) => ({
-      name: s.name,
-      address: s.address,
-      lat: s.lat,
-      lon: s.lon,
-    }));
-    const csv = Papa.unparse(rows);
-    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = "rutas.csv";
-    a.click();
-    URL.revokeObjectURL(a.href);
-  }
-
-  function exportJSON() {
-    const blob = new Blob([JSON.stringify(stops, null, 2)], {
-      type: "application/json",
-    });
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = "rutas.json";
-    a.click();
-    URL.revokeObjectURL(a.href);
-  }
-
-  function importCSV(ev) {
-    const file = ev.target.files?.[0];
-    if (!file) return;
-    Papa.parse(file, {
-      header: true,
-      skipEmptyLines: true,
-      complete: async (res) => {
-        // admite columnas: name,address  (si no hay lat/lon, geocodifica)
-        const rows = res.data ?? [];
-        const out = [];
-        for (const r of rows) {
-          try {
-            let g =
-              r.lat && r.lon
-                ? { lat: parseFloat(r.lat), lon: parseFloat(r.lon), displayName: r.address || "" }
-                : await geocodeAddress(r.address);
-            out.push({
-              id: crypto.randomUUID(),
-              name: (r.name || "Paquete").trim(),
-              address: (r.address || "").trim(),
-              lat: g.lat,
-              lon: g.lon,
-              displayName: g.displayName,
-            });
-          } catch (e) {
-            console.warn("Fila ignorada:", r, e);
-          }
-        }
-        setStops((cur) => [...cur, ...out]);
-        ev.target.value = "";
-      },
-    });
-  }
-
-  function importJSON(ev) {
-    const file = ev.target.files?.[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      try {
-        const arr = JSON.parse(reader.result);
-        if (!Array.isArray(arr)) throw new Error();
-        const mapped = arr.map((s) => ({
-          id: crypto.randomUUID(),
-          name: s.name || "Paquete",
-          address: s.address || "",
-          lat: Number(s.lat),
-          lon: Number(s.lon),
-          displayName: s.displayName || s.address || "",
-        }));
-        setStops((cur) => [...cur, ...mapped]);
-      } catch {
-        alert("JSON inválido");
-      }
-    };
-    reader.readAsText(file);
-    ev.target.value = "";
-  }
-
-  /** ---- QR Scanner ---- **/
+  // ------------- QR ---------------------
   async function openQR() {
-    setQrOpen(true);
-    if (!qrRef.current) return;
-    if (qrObj.current) return; // ya abierto
-    const { Html5Qrcode } = await import("html5-qrcode");
-    const camId = (await Html5Qrcode.getCameras())[0]?.id;
-    if (!camId) {
-      alert("No se encontró cámara");
+    try {
+      await ensureCameraPermission();
+    } catch (e) {
+      alert("Necesito permiso de cámara: " + e.message);
       return;
     }
-    const html5Qr = new Html5Qrcode(qrRef.current.id);
-    qrObj.current = html5Qr;
-    html5Qr.start(
-      camId,
+    setQrOpen(true);
+    // espera a que el modal pinte y el div tenga tamaño
+    requestAnimationFrame(startScanner);
+  }
+
+  async function startScanner() {
+    const el = qrRegionRef.current;
+    if (!el) return;
+    // Aseguramos tamaño visible
+    if (el.clientWidth < 50 || el.clientHeight < 50) {
+      el.style.width = "100%";
+      el.style.height = "320px";
+    }
+    const { Html5Qrcode } = await import("html5-qrcode");
+
+    // limpia instancia previa si existiera
+    if (html5QrRef.current) {
+      try { await html5QrRef.current.stop(); } catch {}
+      try { await html5QrRef.current.clear(); } catch {}
+      html5QrRef.current = null;
+    }
+
+    const cameras = await Html5Qrcode.getCameras();
+    if (!cameras.length) {
+      alert("No se encontró ninguna cámara.");
+      return;
+    }
+    const cameraId = cameras[0].id;
+
+    const scanner = new Html5Qrcode(el.id);
+    html5QrRef.current = scanner;
+
+    await scanner.start(
+      cameraId,
       { fps: 10, qrbox: 250 },
-      async (txt) => {
-        try {
-          // Formatos admitidos:
-          // 1) JSON: {"name":"Caja 12","address":"Calle Mayor 10 Madrid"}
-          // 2) Texto: "Caja 12 | Calle Mayor 10 Madrid"
-          let parsed;
-          try {
-            parsed = JSON.parse(txt);
-          } catch {
-            const [n, ...rest] = txt.split("|");
-            parsed = { name: (n || "Paquete").trim(), address: rest.join("|").trim() };
-          }
-          if (!parsed.address) throw new Error("QR sin dirección");
-          setName(parsed.name || "");
-          setAddress(parsed.address);
-          await addStop(); // geocodifica y añade
-          await closeQR();
-        } catch (e) {
-          alert("QR no válido: " + e.message);
-        }
-      }
+      onScanSuccess,
+      () => {}
     );
   }
 
   async function closeQR() {
-    if (qrObj.current) {
-      try {
-        await qrObj.current.stop();
-        await qrObj.current.clear();
-      } catch {}
-      qrObj.current = null;
+    if (html5QrRef.current) {
+      try { await html5QrRef.current.stop(); } catch {}
+      try { await html5QrRef.current.clear(); } catch {}
+      html5QrRef.current = null;
     }
     setQrOpen(false);
   }
 
-  /** ---- UI ---- **/
+  function onScanSuccess(decodedText /*, decodedResult */) {
+    // Formatos admitidos:
+    // 1) JSON: {"name":"Caja 12","address":"Calle Mayor 10 Madrid"}
+    // 2) Texto simple: "Caja 12 | Calle Mayor 10 Madrid"
+    try {
+      let name = "", address = "";
+      const txt = (decodedText || "").trim();
+      if (!txt) throw new Error("QR vacío");
+
+      try {
+        const obj = JSON.parse(txt);
+        name = (obj.name || "").trim();
+        address = (obj.address || "").trim();
+      } catch {
+        const [n, d] = txt.split("|");
+        name = (n || "").trim();
+        address = (d || "").trim();
+      }
+
+      if (!address) throw new Error("El QR no contiene dirección");
+
+      // Cerrar el QR y usar la misma lógica del formulario
+      closeQR();
+      setPkgName(name);
+      setPkgAddress(address);
+      // auto añadir
+      setTimeout(() => {
+        addPackage();
+      }, 100);
+    } catch (e) {
+      alert("QR inválido: " + e.message);
+    }
+  }
+
+  // ------------- Render -----------------
   return (
-    <div style={{ maxWidth: 780, margin: "0 auto", padding: 16, fontFamily: "system-ui, Arial" }}>
-      <h1>Tony Rutas (Capacitor)</h1>
+    <main style={{ padding: 16, maxWidth: 960, margin: "0 auto" }}>
+      <header style={{ marginBottom: 16 }}>
+        <h1 style={{ margin: 0 }}>Tony Rutas (Capacitor)</h1>
+        <p className="muted" style={{ marginTop: 4 }}>
+          Organiza paquetes, escanea QR y abre la ruta en Google Maps.
+        </p>
+      </header>
 
-      <section style={{ border: "1px solid #ddd", borderRadius: 12, padding: 12, marginBottom: 12 }}>
-        <h3>📍 Origen</h3>
-        <div style={{ display: "flex", gap: 8 }}>
-          <input
-            style={{ flex: 1, padding: 8 }}
-            placeholder="Almacén o punto de salida"
-            value={originText}
-            onChange={(e) => setOriginText(e.target.value)}
-          />
-          <button disabled={busy} onClick={setOriginFromText}>Definir origen</button>
-        </div>
-        {origin && <p style={{ marginTop: 6, color: "#555" }}>Origen: {origin.displayName}</p>}
-      </section>
+      {/* Buscar */}
+      <div className="card" style={{ marginBottom: 12 }}>
+        <input
+          placeholder="Buscar por nombre o dirección…"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          style={{ width: "100%", padding: 10 }}
+        />
+      </div>
 
-      <section style={{ border: "1px solid #ddd", borderRadius: 12, padding: 12, marginBottom: 12 }}>
-        <h3>➕ Añadir paquete</h3>
-        <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+      {/* Origen */}
+      <section className="card" style={{ marginBottom: 12 }}>
+        <h3 style={{ marginTop: 0 }}>📍 Origen</h3>
+        <div className="grid" style={{ gap: 10 }}>
           <input
-            style={{ flex: 0.4, padding: 8 }}
-            placeholder="Nombre"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
+            placeholder="Dirección del almacén / salida"
+            value={originAddress}
+            onChange={(e) => setOriginAddress(e.target.value)}
+            style={{ width: "100%", padding: 10 }}
           />
-          <input
-            style={{ flex: 1, padding: 8 }}
-            placeholder="Dirección completa"
-            value={address}
-            onChange={(e) => setAddress(e.target.value)}
-          />
-          <button disabled={busy} onClick={addStop}>Añadir</button>
-          <button onClick={openQR}>📷 QR</button>
-        </div>
-
-        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-          <button onClick={optimizeOrder} disabled={!origin || stops.length < 2}>⚡ Optimizar orden</button>
-          <button onClick={openMaps} disabled={!origin || stops.length === 0}>🚀 Abrir en Google Maps</button>
-          <button onClick={exportCSV} disabled={stops.length === 0}>⬇️ Exportar CSV</button>
-          <button onClick={exportJSON} disabled={stops.length === 0}>⬇️ Exportar JSON</button>
-          <label style={{ border: "1px solid #ccc", padding: "6px 10px", borderRadius: 6, cursor: "pointer" }}>
-            ⬆️ Importar CSV
-            <input type="file" accept=".csv" style={{ display: "none" }} onChange={importCSV} />
-          </label>
-          <label style={{ border: "1px solid #ccc", padding: "6px 10px", borderRadius: 6, cursor: "pointer" }}>
-            ⬆️ Importar JSON
-            <input type="file" accept=".json" style={{ display: "none" }} onChange={importJSON} />
-          </label>
-          <button onClick={clearAll}>🧹 Limpiar</button>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button className="btn" onClick={setOriginByAddress} disabled={loading}>
+              Definir Origen
+            </button>
+            {origin && (
+              <span className="pill" title={origin.displayName}>
+                {origin.displayName}
+              </span>
+            )}
+          </div>
         </div>
       </section>
 
-      <section style={{ border: "1px solid #ddd", borderRadius: 12, padding: 12, marginBottom: 12 }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          <h3>📦 Paquetes ({stops.length})</h3>
-          <div style={{ color: "#555" }}>Distancia estimada: {totalKm} km</div>
+      {/* Añadir paquete + QR */}
+      <section className="card" style={{ marginBottom: 12 }}>
+        <h3 style={{ marginTop: 0 }}>➕ Añadir paquete</h3>
+        <div className="grid" style={{ gap: 10 }}>
+          <input
+            placeholder="Nombre (opcional)"
+            value={pkgName}
+            onChange={(e) => setPkgName(e.target.value)}
+            style={{ width: "100%", padding: 10 }}
+          />
+          <input
+            placeholder="Dirección"
+            value={pkgAddress}
+            onChange={(e) => setPkgAddress(e.target.value)}
+            style={{ width: "100%", padding: 10 }}
+          />
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <button className="btn" onClick={addPackage} disabled={loading}>
+              Añadir
+            </button>
+            <button className="btn" onClick={openQR}>
+              📷 Escanear QR
+            </button>
+            <button className="btn danger" onClick={clearAll} disabled={packages.length === 0}>
+              Vaciar lista
+            </button>
+          </div>
+          {msg && <div className="muted">{msg}</div>}
         </div>
-        {stops.length === 0 ? (
-          <p>Sin paquetes.</p>
+      </section>
+
+      {/* Lista de paquetes */}
+      <section className="card" style={{ marginBottom: 12 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+          <h3 style={{ marginTop: 0 }}>📦 Paquetes ({packages.length})</h3>
+          <button className="btn" onClick={openInGoogleMaps} disabled={!origin || packages.length === 0}>
+            🚀 Optimizar (orden actual) y abrir en Google Maps
+          </button>
+        </div>
+
+        {filtered.length === 0 ? (
+          <div className="muted">Sin paquetes.</div>
         ) : (
-          <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
-            {stops.map((s, i) => (
-              <li key={s.id} style={{ padding: "8px 0", borderBottom: "1px solid #eee", display: "flex", gap: 8 }}>
-                <div style={{ width: 28, opacity: 0.6 }}>{i + 1}.</div>
-                <div style={{ flex: 1 }}>
-                  <div style={{ fontWeight: 600 }}>{s.name}</div>
-                  <div style={{ fontSize: 13, color: "#555" }}>{s.displayName || s.address}</div>
+          <div className="list">
+            {filtered.map((p, i) => (
+              <div key={p.id} className="item" style={{ justifyContent: "space-between" }}>
+                <div>
+                  <div style={{ fontWeight: 600 }}>{p.name}</div>
+                  <div className="muted" title={p.displayName}>
+                    {p.address}
+                  </div>
                 </div>
-                <button onClick={() => removeStop(s.id)}>🗑️</button>
-              </li>
+                <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                  <span className="pill">#{i + 1}</span>
+                  <button className="btn ghost" onClick={() => removePackage(p.id)}>
+                    Eliminar
+                  </button>
+                </div>
+              </div>
             ))}
-          </ul>
+          </div>
         )}
       </section>
 
@@ -390,26 +374,36 @@ export default function App() {
           style={{
             position: "fixed",
             inset: 0,
-            background: "rgba(0,0,0,0.6)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
+            background: "rgba(0,0,0,.5)",
+            display: "grid",
+            placeItems: "center",
             zIndex: 9999,
           }}
-          onClick={closeQR}
         >
           <div
-            onClick={(e) => e.stopPropagation()}
-            style={{ background: "#fff", padding: 12, borderRadius: 12, width: 340 }}
+            className="card"
+            style={{ width: "92%", maxWidth: 520, background: "#fff", padding: 16, borderRadius: 12 }}
           >
-            <h3>Escanear QR</h3>
-            <div id="qr-region" ref={qrRef} style={{ width: 300, height: 300, margin: "0 auto" }} />
-            <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 8 }}>
-              <button onClick={closeQR}>Cerrar</button>
+            <h3 style={{ marginTop: 0 }}>Escanear QR</h3>
+            <div
+              id="qr-region"
+              ref={qrRegionRef}
+              style={{
+                width: "100%",
+                height: 320,
+                background: "#000",
+                borderRadius: 8,
+                overflow: "hidden",
+              }}
+            />
+            <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 12 }}>
+              <button className="btn" onClick={closeQR}>
+                Cerrar
+              </button>
             </div>
           </div>
         </div>
       )}
-    </div>
+    </main>
   );
 }
