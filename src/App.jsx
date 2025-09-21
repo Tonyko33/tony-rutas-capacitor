@@ -3,27 +3,49 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Camera, CameraDirection, CameraResultType, CameraSource } from "@capacitor/camera";
 
 /* =========================
-   Utilidades
+   Utilidades y parsing
    ========================= */
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const toRad = (d) => (d * Math.PI) / 180;
+
+function haversine(a, b) {
+  const R = 6371;
+  const dLat = toRad(b[0] - a[0]);
+  const dLon = toRad(b[1] - a[1]);
+  const la1 = toRad(a[0]);
+  const la2 = toRad(b[0]);
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(la1) * Math.cos(la2) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
+// Heurística: ¿parece una dirección?
+function looksLikeAddress(s) {
+  const t = (s || "").toLowerCase();
+  if (t.includes(",")) return true; // calle, nº, ciudad
+  if (/\d{4,5}/.test(t)) return true; // CP
+  if (/(calle|c\/|avda|avenida|plaza|camino|carretera|barrio)/i.test(t)) return true;
+  return false;
+}
 
 function parseQRText(txt) {
   if (!txt) return null;
 
+  // 0) Trim
+  const raw = txt.trim();
+
   // 1) JSON válido
   try {
-    const obj = JSON.parse(txt);
+    const obj = JSON.parse(raw);
     if (obj && (obj.address || obj.dir || obj.direccion)) {
       return { name: obj.name || obj.nombre || "Sin nombre", address: obj.address || obj.dir || obj.direccion };
     }
   } catch {}
 
-  // 2) JSON con comillas simples → convertir rápidamente a dobles
-  const maybeJson = txt.trim();
-  if (maybeJson.startsWith("{") && maybeJson.endsWith("}")) {
+  // 2) JSON con comillas simples o claves distintas
+  if (raw.startsWith("{") && raw.endsWith("}")) {
     try {
-      const fixed = maybeJson
+      const fixed = raw
         .replace(/'/g, '"')
         .replace(/\bnombre\b/g, '"name"')
         .replace(/\bdireccion\b/g, '"address"')
@@ -35,35 +57,29 @@ function parseQRText(txt) {
     } catch {}
   }
 
-  // 3) Texto: "Nombre | Dirección"
-  const pipes = txt.split("|");
+  // 3) "Nombre | Dirección"
+  const pipes = raw.split("|");
   if (pipes.length === 2) {
-    return { name: pipes[0].trim(), address: pipes[1].trim() };
+    return { name: pipes[0].trim() || "Sin nombre", address: pipes[1].trim() };
   }
 
-  // 4) Texto en dos líneas
-  const lines = txt.split("\n").map((s) => s.trim()).filter(Boolean);
+  // 4) 2 líneas (nombre en primera, dirección en el resto)
+  const lines = raw.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
   if (lines.length >= 2) {
-    return { name: lines[0], address: lines.slice(1).join(", ") };
+    const name = lines[0];
+    const addr = lines.slice(1).join(", ");
+    return { name: name || "Sin nombre", address: addr };
   }
 
-  // 5) address: ...
-  const m = txt.match(/address\s*:\s*([^}\n\r]+)/i);
-  if (m) return { name: "Sin nombre", address: m[1].trim() };
+  // 5) "address: ...", "dir: ...", "direccion: ..."
+  const m = raw.match(/\b(address|dir|direccion)\s*[:=]\s*([^}\n\r]+)/i);
+  if (m) return { name: "Sin nombre", address: m[2].trim() };
 
-  return null;
-}
+  // 6) Si parece claramente una dirección, úsala como address
+  if (looksLikeAddress(raw)) return { name: "Sin nombre", address: raw };
 
-const toRad = (d) => (d * Math.PI) / 180;
-function haversine(a, b) {
-  // a = [lat, lon], b = [lat, lon]
-  const R = 6371; // km
-  const dLat = toRad(b[0] - a[0]);
-  const dLon = toRad(b[1] - a[1]);
-  const la1 = toRad(a[0]);
-  const la2 = toRad(b[0]);
-  const h = Math.sin(dLat / 2) ** 2 + Math.cos(la1) * Math.cos(la2) * Math.sin(dLon / 2) ** 2;
-  return 2 * R * Math.asin(Math.sqrt(h));
+  // 7) Probablemente un código 1D (tracking). Devolveremos "name" y que el usuario ponga dirección.
+  return { name: raw, address: "" };
 }
 
 /* =========================
@@ -71,57 +87,96 @@ function haversine(a, b) {
    ========================= */
 async function geocodeAddress(q) {
   const url =
-    "https://nominatim.openstreetmap.org/search?format=jsonv2&q=" +
-    encodeURIComponent(q);
+    "https://nominatim.openstreetmap.org/search?format=jsonv2&q=" + encodeURIComponent(q);
   const res = await fetch(url, {
     headers: {
-      "Accept": "application/json",
-      // Nominatim recomienda identificar la aplicación
-      "User-Agent": "TonyRutas/1.0 (capacitor)"
-    }
+      Accept: "application/json",
+      "User-Agent": "TonyRutas/1.0 (capacitor)",
+    },
   });
   if (!res.ok) throw new Error("Error geocoding");
   const data = await res.json();
   if (!Array.isArray(data) || data.length === 0) throw new Error("Sin resultados");
   const hit = data[0];
-  return { lat: parseFloat(hit.lat), lon: parseFloat(hit.lon), displayName: hit.display_name };
+  return {
+    lat: parseFloat(hit.lat),
+    lon: parseFloat(hit.lon),
+    displayName: hit.display_name,
+  };
 }
 
 /* =========================
-   Escáner QR (BarcodeDetector)
-   - Grande, cámara trasera
+   Escáner universal (QR + 1D)
    ========================= */
 function QROverlay({ onCancel, onResult }) {
   const videoRef = useRef(null);
   const rafRef = useRef(0);
-  const detector = useMemo(() => {
-    // BarcodeDetector está en Chrome/Android modernos
-    return "BarcodeDetector" in window
-      ? new window.BarcodeDetector({ formats: ["qr_code"] })
-      : null;
+  const [lastType, setLastType] = useState("");
+
+  const supportedDetector = useMemo(() => {
+    return "BarcodeDetector" in window ? window.BarcodeDetector : null;
   }, []);
+
+  const detectorRef = useRef(null);
 
   useEffect(() => {
     let stream;
     let disposed = false;
 
+    async function buildDetector() {
+      if (!supportedDetector) return null;
+
+      let formats = [
+        "qr_code",
+        "code_128",
+        "code_39",
+        "code_93",
+        "ean_13",
+        "ean_8",
+        "upc_a",
+        "upc_e",
+        "itf",
+        "codabar",
+        "data_matrix",
+        "pdf417",
+        "aztec",
+      ];
+
+      // Si el navegador soporta consulta:
+      try {
+        if (supportedDetector.getSupportedFormats) {
+          const sup = await supportedDetector.getSupportedFormats();
+          formats = formats.filter((f) => sup.includes(f));
+        }
+      } catch {}
+
+      return new supportedDetector({ formats });
+    }
+
     async function start() {
       try {
-        // Cámara trasera + tamaño grande
         stream = await navigator.mediaDevices.getUserMedia({
           video: {
             facingMode: { ideal: "environment" },
             width: { ideal: 1280 },
-            height: { ideal: 720 }
+            height: { ideal: 720 },
           },
-          audio: false
+          audio: false,
         });
         if (disposed) return;
+
         videoRef.current.srcObject = stream;
         await videoRef.current.play();
 
-        if (!detector) {
-          alert("Este dispositivo no soporta el lector nativo (BarcodeDetector). Actualiza WebView/Chrome.");
+        if (!supportedDetector) {
+          alert("Este dispositivo no soporta lector nativo. Actualiza WebView/Chrome.");
+          onCancel();
+          return;
+        }
+
+        detectorRef.current = await buildDetector();
+        if (!detectorRef.current) {
+          alert("No se pudo inicializar el lector.");
           onCancel();
           return;
         }
@@ -129,19 +184,20 @@ function QROverlay({ onCancel, onResult }) {
         const tick = async () => {
           if (disposed) return;
           try {
-            const codes = await detector.detect(videoRef.current);
+            const codes = await detectorRef.current.detect(videoRef.current);
             if (codes && codes.length > 0) {
-              const raw = codes[0].rawValue || "";
-              onResult(raw);
-              return; // cerrará desde arriba
+              // Pick el más confiable
+              const best = codes[0];
+              setLastType(best.format || "");
+              const raw = best.rawValue || "";
+              onResult({ raw, type: best.format || "unknown" });
+              return;
             }
-          } catch (e) {
-            // sigue intentando
-          }
+          } catch {}
           rafRef.current = requestAnimationFrame(tick);
         };
         rafRef.current = requestAnimationFrame(tick);
-      } catch (e) {
+      } catch {
         alert("No se pudo abrir la cámara. Revisa permisos de cámara.");
         onCancel();
       }
@@ -155,13 +211,14 @@ function QROverlay({ onCancel, onResult }) {
         stream && stream.getTracks().forEach((t) => t.stop());
       } catch {}
     };
-  }, [detector, onCancel, onResult]);
+  }, [supportedDetector, onCancel, onResult]);
 
   return (
     <div style={styles.overlay}>
       <div style={styles.scannerWrap}>
         <video ref={videoRef} playsInline style={styles.video} />
         <div style={styles.frame} />
+        <div style={styles.badge}>{lastType || "escaneando…"}</div>
         <button onClick={onCancel} style={styles.closeBtn}>Cerrar</button>
       </div>
     </div>
@@ -169,7 +226,7 @@ function QROverlay({ onCancel, onResult }) {
 }
 
 /* =========================
-   Componente principal
+   App principal
    ========================= */
 export default function App() {
   const [originText, setOriginText] = useState("");
@@ -187,7 +244,7 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
 
-  // calcular distancia estimada (suma tramos en orden actual)
+  // Distancia estimada
   useEffect(() => {
     (async () => {
       try {
@@ -198,7 +255,10 @@ export default function App() {
         let km = 0;
         let prev = originLL;
         for (const it of items) {
-          if (!it.lat || !it.lon) { setDistanceKm(0); return; }
+          if (!it.lat || !it.lon) {
+            setDistanceKm(0);
+            return;
+          }
           km += haversine([prev.lat, prev.lon], [it.lat, it.lon]);
           prev = { lat: it.lat, lon: it.lon };
         }
@@ -224,7 +284,10 @@ export default function App() {
   }
 
   async function addPackage() {
-    if (!addressText.trim()) { alert("Escribe/escanea una dirección"); return; }
+    if (!addressText.trim()) {
+      alert("Escribe/escanea una dirección");
+      return;
+    }
     setBusy(true); setMsg("Geocodificando paquete…");
     try {
       const g = await geocodeAddress(addressText.trim());
@@ -239,10 +302,9 @@ export default function App() {
           lat: g.lat,
           lon: g.lon,
           note: note.trim(),
-          photo: photoDataUrl || ""
-        }
+          photo: photoDataUrl || "",
+        },
       ]);
-      // reset campos
       setName("");
       setAddressText("");
       setNote("");
@@ -262,11 +324,9 @@ export default function App() {
         direction: CameraDirection.Rear,
         resultType: CameraResultType.DataUrl,
         quality: 70,
-        allowEditing: false
+        allowEditing: false,
       });
-      if (p && p.dataUrl) {
-        setPhotoDataUrl(p.dataUrl);
-      }
+      if (p && p.dataUrl) setPhotoDataUrl(p.dataUrl);
     } catch {
       alert("No se pudo hacer la foto. Revisa permisos de cámara.");
     }
@@ -278,7 +338,6 @@ export default function App() {
 
   function optimizeOrder() {
     if (!originLL || items.length <= 2) return;
-    // heurística nearest-neighbor desde el origen
     const rem = [...items];
     const out = [];
     let cur = originLL;
@@ -307,20 +366,30 @@ export default function App() {
 
   function openInGoogleMaps() {
     if (!originLL || items.length === 0) return;
-    const MAX = 9; // límite típico de waypoints por ruta
+    const MAX = 9;
     const chunk = items.slice(0, Math.min(items.length, MAX));
     const url = googleMapsDirLink(originLL, chunk);
     window.open(url, "_blank");
   }
 
-  function onQRDetected(raw) {
+  function onScanResult({ raw, type }) {
     const info = parseQRText(raw);
+
     if (!info) {
-      alert("QR inválido: no se encontró dirección");
-    } else {
-      setName(info.name || "");
-      setAddressText(info.address || "");
+      alert("No se pudo interpretar el código.");
+      setQrOpen(false);
+      return;
     }
+
+    // Si no hay address y parece tracking (1D)
+    if (!info.address) {
+      setName(info.name || raw || "Seguimiento");
+      alert("Código detectado (probable seguimiento). Añade la dirección manual o escanéala en otro código.");
+    } else {
+      setName(info.name || "Sin nombre");
+      setAddressText(info.address);
+    }
+
     setQrOpen(false);
   }
 
@@ -329,7 +398,7 @@ export default function App() {
       <header style={styles.header}>
         <h1 style={{ margin: 0 }}>Tony Rutas (Capacitor)</h1>
         <div style={{ color: "#6b7280" }}>
-          Origen + paquetes, <b>fotos</b>, <b>notas</b>, escáner QR y <b>optimización de ruta</b>.
+          Origen + paquetes, <b>fotos</b>, <b>notas</b>, escáner <b>QR/código de barras</b> y <b>optimización de ruta</b>.
         </div>
       </header>
 
@@ -344,11 +413,7 @@ export default function App() {
           />
           <button style={styles.btnPrimary} onClick={setOrigin} disabled={busy}>Definir Origen</button>
         </div>
-        {originLL && (
-          <div style={{ marginTop: 8, color: "#16a34a" }}>
-            ✅ {originLL.displayName}
-          </div>
-        )}
+        {originLL && <div style={{ marginTop: 8, color: "#16a34a" }}>✅ {originLL.displayName}</div>}
       </section>
 
       {/* Añadir paquete */}
@@ -357,10 +422,11 @@ export default function App() {
 
         <input
           style={styles.input}
-          placeholder="Nombre del paquete"
+          placeholder="Nombre del paquete / Seguimiento"
           value={name}
           onChange={(e) => setName(e.target.value)}
         />
+
         <div style={{ display: "flex", gap: 8 }}>
           <input
             style={styles.input}
@@ -369,6 +435,7 @@ export default function App() {
             onChange={(e) => setAddressText(e.target.value)}
           />
         </div>
+
         <textarea
           style={styles.textarea}
           placeholder="Nota (opcional)"
@@ -379,16 +446,10 @@ export default function App() {
 
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
           <button style={styles.btnPrimary} onClick={addPackage} disabled={busy}>Añadir</button>
-          <button style={styles.btn} onClick={() => setQrOpen(true)}>📷 Escanear QR</button>
+          <button style={styles.btn} onClick={() => setQrOpen(true)}>📷 Escanear QR / Código</button>
           <button style={styles.btn} onClick={takePhoto}>📸 Foto del paquete</button>
           <button style={styles.btnGhost} onClick={() => { setName(""); setAddressText(""); setNote(""); setPhotoDataUrl(""); }}>Vaciar campos</button>
         </div>
-
-        {!originLL && items.length === 0 && (
-          <div style={{ marginTop: 8, color: "#9ca3af" }}>
-            Consejo: define primero el origen para calcular distancias.
-          </div>
-        )}
 
         {msg && <div style={{ marginTop: 8, color: "#2563eb" }}>{msg}</div>}
       </section>
@@ -438,13 +499,13 @@ export default function App() {
         )}
       </section>
 
-      {qrOpen && <QROverlay onCancel={() => setQrOpen(false)} onResult={onQRDetected} />}
+      {qrOpen && <QROverlay onCancel={() => setQrOpen(false)} onResult={onScanResult} />}
     </div>
   );
 }
 
 /* =========================
-   Estilos inline sencillos
+   Estilos
    ========================= */
 const styles = {
   page: { maxWidth: 900, margin: "0 auto", padding: 16 },
@@ -458,11 +519,14 @@ const styles = {
   btnDanger: { background: "#fee2e2", color: "#991b1b", border: "1px solid #fecaca", borderRadius: 10, padding: "8px 12px", cursor: "pointer", marginLeft: 8 },
   h2: { margin: 0, marginBottom: 12, fontSize: 20 },
   item: { display: "flex", alignItems: "center", gap: 12, border: "1px solid #e5e7eb", borderRadius: 12, padding: 12 },
-  /* QR overlay */
-  overlay: { position: "fixed", inset: 0, background: "rgba(0,0,0,0.8)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 9999, padding: 12 },
+
+  // Escáner
+  overlay: { position: "fixed", inset: 0, background: "rgba(0,0,0,0.85)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 9999, padding: 12 },
   scannerWrap: { position: "relative", width: "min(100%, 720px)", aspectRatio: "16/9", background: "#000", borderRadius: 16, overflow: "hidden", border: "1px solid #334155" },
   video: { width: "100%", height: "100%", objectFit: "cover" },
   frame: { position: "absolute", inset: "10%", border: "3px solid rgba(255,255,255,0.9)", borderRadius: 16, boxShadow: "0 0 0 100vmax rgba(0,0,0,0.25) inset" },
-  closeBtn: { position: "absolute", right: 12, bottom: 12, background: "#111827", color: "#fff", border: "1px solid #374151", borderRadius: 10, padding: "10px 12px", cursor: "pointer" }
+  closeBtn: { position: "absolute", right: 12, bottom: 12, background: "#111827", color: "#fff", border: "1px solid #374151", borderRadius: 10, padding: "10px 12px", cursor: "pointer" },
+  badge: { position: "absolute", left: 12, top: 12, background: "rgba(17,24,39,0.8)", color: "#fff", border: "1px solid #4b5563", borderRadius: 10, padding: "6px 10px", fontSize: 12, textTransform: "uppercase", letterSpacing: 0.5 },
 };
+
 
