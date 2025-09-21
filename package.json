@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@capacitor/android": "^6.1.0",
+    "@capacitor/camera": "^6.1.2",
     "@capacitor/core": "^6.1.0",
     "html5-qrcode": "^2.3.8",
     "lucide-react": "^0.460.0",
