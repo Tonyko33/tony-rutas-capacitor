@@ -40,12 +40,11 @@ async function ensureCameraPermission() {
   stream.getTracks().forEach(t => t.stop());
 }
 
-/* Parser tolerante para QR */
+/* ---- Parser tolerante para QR ---- */
 function parseQrPayload(raw) {
   const txt = (raw || "").trim();
   if (!txt) throw new Error("QR vacío");
 
-  // 1) JSON (claves en español/inglés)
   try {
     const obj = JSON.parse(txt);
     const name =
@@ -55,7 +54,6 @@ function parseQrPayload(raw) {
     if (address) return { name: name || "(QR)", address };
   } catch (_) {}
 
-  // 2) Dos líneas: nombre / dirección
   if (txt.includes("\n")) {
     const lines = txt.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
     if (lines.length >= 2) {
@@ -65,7 +63,6 @@ function parseQrPayload(raw) {
     }
   }
 
-  // 3) Separadores comunes
   const m = txt.match(/^(.+?)\s*(?:\||,|;|-)\s+(.+)$/);
   if (m) {
     const name = m[1].trim() || "(QR)";
@@ -73,7 +70,6 @@ function parseQrPayload(raw) {
     if (address) return { name, address };
   }
 
-  // 4) Solo dirección (si parece una dirección, la aceptamos)
   if (/\S+\s+\S+/.test(txt)) {
     return { name: "(QR)", address: txt };
   }
@@ -81,11 +77,87 @@ function parseQrPayload(raw) {
   throw new Error("El QR no contiene dirección");
 }
 
+/* ---- Distancias y optimización ---- */
+const R = 6371; // km
+function haversine(a, b) {
+  const dLat = ((b.lat - a.lat) * Math.PI) / 180;
+  const dLon = ((b.lon - a.lon) * Math.PI) / 180;
+  const la1 = (a.lat * Math.PI) / 180;
+  const la2 = (b.lat * Math.PI) / 180;
+  const sinDLat = Math.sin(dLat / 2);
+  const sinDLon = Math.sin(dLon / 2);
+  const h = sinDLat * sinDLat + Math.cos(la1) * Math.cos(la2) * sinDLon * sinDLon;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
+function routeDistance(origin, stops) {
+  if (!origin || stops.length === 0) return 0;
+  let sum = 0;
+  let prev = origin;
+  for (const p of stops) {
+    sum += haversine(prev, p);
+    prev = p;
+  }
+  return sum; // sin vuelta al origen (one-way)
+}
+
+// Nearest Neighbor (origen fijo)
+function nearestNeighbor(origin, stops) {
+  const remaining = stops.slice();
+  const ordered = [];
+  let current = origin;
+  while (remaining.length) {
+    let bestIdx = 0;
+    let bestDist = Infinity;
+    for (let i = 0; i < remaining.length; i++) {
+      const d = haversine(current, remaining[i]);
+      if (d < bestDist) {
+        bestDist = d;
+        bestIdx = i;
+      }
+    }
+    const next = remaining.splice(bestIdx, 1)[0];
+    ordered.push(next);
+    current = next;
+  }
+  return ordered;
+}
+
+// 2-Opt sobre la secuencia (origen fijo fuera)
+function twoOpt(origin, stops) {
+  if (stops.length < 3) return stops.slice();
+  let best = stops.slice();
+  let improved = true;
+  const baseDist = () => routeDistance(origin, best);
+
+  while (improved) {
+    improved = false;
+    for (let i = 0; i < best.length - 2; i++) {
+      for (let k = i + 1; k < best.length - 1; k++) {
+        const newRoute = best.slice(0, i + 1).concat(best.slice(i + 1, k + 1).reverse(), best.slice(k + 1));
+        if (routeDistance(origin, newRoute) + 1e-9 < baseDist()) {
+          best = newRoute;
+          improved = true;
+        }
+      }
+    }
+  }
+  return best;
+}
+
+function optimizeRoute(origin, stops) {
+  if (!origin || stops.length < 2) return stops.slice();
+  const nn = nearestNeighbor(origin, stops);
+  const improved = twoOpt(origin, nn);
+  return improved;
+}
+
 /* ===================== App ===================== */
 export default function App() {
   // Persistencia
   const [origin, setOrigin] = useState(null);
   const [packages, setPackages] = useState([]);
+  const [prevOrder, setPrevOrder] = useState(null);
 
   // Formularios
   const [originAddress, setOriginAddress] = useState("");
@@ -99,7 +171,7 @@ export default function App() {
 
   // QR
   const [qrOpen, setQrOpen] = useState(false);
-  const [useBack, setUseBack] = useState(true); // por defecto, cámara trasera
+  const [useBack, setUseBack] = useState(true);
   const qrRegionRef = useRef(null);
   const html5QrRef = useRef(null);
   const camerasRef = useRef([]);
@@ -133,6 +205,10 @@ export default function App() {
         (p.displayName || "").toLowerCase().includes(q)
     );
   }, [search, packages]);
+
+  const estKm = useMemo(() => {
+    return Math.round(routeDistance(origin, packages) * 10) / 10;
+  }, [origin, packages]);
 
   /* --- Acciones principales --- */
   async function setOriginByAddress() {
@@ -182,6 +258,23 @@ export default function App() {
     window.open(googleMapsDirLink(origin, packages), "_blank");
   }
 
+  /* --- Optimización --- */
+  function optimize() {
+    if (!origin) return alert("Primero define el origen.");
+    if (packages.length < 2) return alert("Añade al menos 2 paradas.");
+    setPrevOrder(packages.slice()); // guardar para deshacer
+    const optimized = optimizeRoute(origin, packages);
+    setPackages(optimized);
+    setMsg("Ruta optimizada ✅");
+  }
+  function undoOptimize() {
+    if (prevOrder) {
+      setPackages(prevOrder);
+      setPrevOrder(null);
+      setMsg("Orden restaurado.");
+    }
+  }
+
   /* --- QR: abrir, iniciar, cerrar --- */
   async function openQR() {
     try { await ensureCameraPermission(); }
@@ -194,24 +287,20 @@ export default function App() {
     const el = qrRegionRef.current;
     if (!el) return;
 
-    // Tamaño grande (pantalla completa dentro del modal)
     el.style.width = "100%";
     el.style.height = "100%";
 
     const { Html5Qrcode } = await import("html5-qrcode");
 
-    // Limpia anteriores
     if (html5QrRef.current) {
       try { await html5QrRef.current.stop(); } catch {}
       try { await html5QrRef.current.clear(); } catch {}
       html5QrRef.current = null;
     }
 
-    // Cámaras disponibles (tras pedir permiso, labels accesibles)
     const cams = await Html5Qrcode.getCameras();
     camerasRef.current = cams;
 
-    // Elegir trasera/delantera según toggle
     const wanted = useBack ? /back|rear|environment/i : /front|user/i;
     const match = cams.find(c => wanted.test(c.label));
     const cameraConfig = match
@@ -221,7 +310,6 @@ export default function App() {
     const scanner = new Html5Qrcode(el.id);
     html5QrRef.current = scanner;
 
-    // Caja de escaneo grande (80% del lado corto)
     const boxSize = Math.floor(Math.min(el.clientWidth, el.clientHeight) * 0.8);
 
     await scanner.start(
@@ -244,7 +332,6 @@ export default function App() {
   function onScanSuccess(decodedText) {
     try {
       const { name, address } = parseQrPayload(decodedText);
-      // cerrar y reutilizar alta normal
       closeQR();
       setPkgName(name);
       setPkgAddress(address);
@@ -260,7 +347,7 @@ export default function App() {
       <header style={{ marginBottom: 16 }}>
         <h1 style={{ margin: 0 }}>Tony Rutas (Capacitor)</h1>
         <p className="muted" style={{ marginTop: 4 }}>
-          Origen + paquetes, escáner QR (cámara trasera) y ruta en Google Maps.
+          Origen + paquetes, escáner QR, <b>optimización de ruta</b> y apertura en Google Maps.
         </p>
       </header>
 
@@ -318,19 +405,32 @@ export default function App() {
         </div>
       </section>
 
+      {/* Controles de ruta */}
+      <section className="card" style={{ marginBottom: 12 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            <button className="btn" onClick={openInGoogleMaps} disabled={!origin || packages.length === 0}>
+              🚀 Abrir en Google Maps
+            </button>
+            <button className="btn" onClick={optimize} disabled={!origin || packages.length < 2}>
+              ⚡ Optimizar orden
+            </button>
+            <button className="btn ghost" onClick={undoOptimize} disabled={!prevOrder}>
+              Deshacer
+            </button>
+          </div>
+          <div className="muted">Distancia estimada: <b>{estKm} km</b></div>
+        </div>
+      </section>
+
       {/* Lista */}
       <section className="card" style={{ marginBottom: 12 }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
-          <h3 style={{ marginTop: 0 }}>📦 Paquetes ({packages.length})</h3>
-          <button className="btn" onClick={openInGoogleMaps} disabled={!origin || packages.length === 0}>
-            🚀 Abrir en Google Maps
-          </button>
-        </div>
-        {filtered.length === 0 ? (
+        <h3 style={{ marginTop: 0 }}>📦 Paquetes ({packages.length})</h3>
+        {packages.length === 0 ? (
           <div className="muted">Sin paquetes.</div>
         ) : (
           <div className="list">
-            {filtered.map((p, i) => (
+            {packages.map((p, i) => (
               <div key={p.id} className="item" style={{ justifyContent: "space-between" }}>
                 <div>
                   <div style={{ fontWeight: 600 }}>{p.name}</div>
@@ -365,10 +465,7 @@ export default function App() {
             <div style={{ padding: 12, color: "#fff", fontWeight: 600, display: "flex", justifyContent: "space-between" }}>
               <span>Escanear QR (cámara {useBack ? "trasera" : "delantera"})</span>
               <div style={{ display: "flex", gap: 8 }}>
-                <button
-                  className="btn ghost"
-                  onClick={async () => { setUseBack(v => !v); await startScanner(); }}
-                >
+                <button className="btn ghost" onClick={async () => { setUseBack(v => !v); await startScanner(); }}>
                   Cambiar cámara
                 </button>
                 <button className="btn" onClick={closeQR}>Cerrar</button>
@@ -386,3 +483,4 @@ export default function App() {
     </main>
   );
 }
+
