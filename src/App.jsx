@@ -1,13 +1,16 @@
 // src/App.jsx
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import { Capacitor } from "@capacitor/core";
 import { Camera, CameraDirection, CameraResultType, CameraSource } from "@capacitor/camera";
+import { BarcodeScanner } from "@capacitor-mlkit/barcode-scanning";
+import { TextRecognition } from "@capacitor-mlkit/text-recognition";
 
-/* =========================
-   Utilidades y parsing
-   ========================= */
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+/* ====== Util ====== */
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const toRad = (d) => (d * Math.PI) / 180;
+const looksLikeAddress = (s="") =>
+  /calle|c\/|avda|avenida|plaza|camino|carretera|barrio|carrer|paseo|ps\./i.test(s) ||
+  /\d{4,5}/.test(s) || s.includes(",");
 
 function haversine(a, b) {
   const R = 6371;
@@ -15,182 +18,127 @@ function haversine(a, b) {
   const dLon = toRad(b[1] - a[1]);
   const la1 = toRad(a[0]);
   const la2 = toRad(b[0]);
-  const h = Math.sin(dLat / 2) ** 2 + Math.cos(la1) * Math.cos(la2) * Math.sin(dLon / 2) ** 2;
-  return 2 * R * Math.asin(Math.sqrt(h));
+  const h = Math.sin(dLat/2)**2 + Math.cos(la1)*Math.cos(la2)*Math.sin(dLon/2)**2;
+  return 2*R*Math.asin(Math.sqrt(h));
 }
 
-// Heurística: ¿parece una dirección?
-function looksLikeAddress(s) {
-  const t = (s || "").toLowerCase();
-  if (t.includes(",")) return true; // calle, nº, ciudad
-  if (/\d{4,5}/.test(t)) return true; // CP
-  if (/(calle|c\/|avda|avenida|plaza|camino|carretera|barrio)/i.test(t)) return true;
-  return false;
+/* ====== Geocoding con fallback ====== */
+async function geocodeOSM(q, opts={}) {
+  const base = "https://nominatim.openstreetmap.org/search";
+  const url = `${base}?format=jsonv2&q=${encodeURIComponent(q)}&countrycodes=es&addressdetails=1`;
+  const res = await fetch(url, { headers:{
+    Accept:"application/json",
+    "User-Agent":"TonyRutas/1.0"
+  }});
+  if (!res.ok) throw new Error("geocode http");
+  const data = await res.json();
+  if (!Array.isArray(data) || data.length===0) throw new Error("no results");
+  const hit = data[0];
+  return { lat: +hit.lat, lon: +hit.lon, displayName: hit.display_name };
 }
 
-function parseQRText(txt) {
-  if (!txt) return null;
+async function smartGeocode(input, defaultCity) {
+  const tries = [
+    input,
+    `${input}, ${defaultCity}`,
+    `${input}, España`,
+  ];
+  for (const q of tries) {
+    try {
+      return await geocodeOSM(q);
+    } catch {}
+  }
+  throw new Error("Sin resultados");
+}
 
-  // 0) Trim
-  const raw = txt.trim();
+/* ====== Parser de códigos ====== */
+function parseScannedText(raw) {
+  if (!raw) return { name:"", address:"" };
+  const t = raw.trim();
 
-  // 1) JSON válido
+  // JSON directo
   try {
-    const obj = JSON.parse(raw);
-    if (obj && (obj.address || obj.dir || obj.direccion)) {
-      return { name: obj.name || obj.nombre || "Sin nombre", address: obj.address || obj.dir || obj.direccion };
-    }
+    const obj = JSON.parse(t);
+    const address = obj.address || obj.dir || obj.direccion || "";
+    const name = obj.name || obj.nombre || "";
+    if (address) return { name: name || "Sin nombre", address };
   } catch {}
 
-  // 2) JSON con comillas simples o claves distintas
-  if (raw.startsWith("{") && raw.endsWith("}")) {
+  // JSON con comillas simples / claves distintas
+  if (t.startsWith("{") && t.endsWith("}")) {
     try {
-      const fixed = raw
-        .replace(/'/g, '"')
-        .replace(/\bnombre\b/g, '"name"')
-        .replace(/\bdireccion\b/g, '"address"')
-        .replace(/\bdir\b/g, '"address"');
+      const fixed = t
+        .replace(/'/g,'"')
+        .replace(/\bnombre\b/g,'"name"')
+        .replace(/\bdireccion\b/g,'"address"')
+        .replace(/\bdir\b/g,'"address"');
       const obj = JSON.parse(fixed);
-      if (obj && (obj.address || obj.dir || obj.direccion)) {
-        return { name: obj.name || obj.nombre || "Sin nombre", address: obj.address || obj.dir || obj.direccion };
-      }
+      const address = obj.address || "";
+      const name = obj.name || "";
+      if (address) return { name: name || "Sin nombre", address };
     } catch {}
   }
 
-  // 3) "Nombre | Dirección"
-  const pipes = raw.split("|");
-  if (pipes.length === 2) {
-    return { name: pipes[0].trim() || "Sin nombre", address: pipes[1].trim() };
+  // "Nombre | Dirección"
+  const pipe = t.split("|");
+  if (pipe.length===2) return { name: pipe[0].trim()||"Sin nombre", address: pipe[1].trim() };
+
+  // 2+ líneas
+  const lines = t.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
+  if (lines.length>=2) {
+    // Buscar línea con CP/dirección
+    let addrLine = lines.find(L => looksLikeAddress(L)) || lines.slice(1).join(", ");
+    const name = lines[0] || "Sin nombre";
+    return { name, address: addrLine };
   }
 
-  // 4) 2 líneas (nombre en primera, dirección en el resto)
-  const lines = raw.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
-  if (lines.length >= 2) {
-    const name = lines[0];
-    const addr = lines.slice(1).join(", ");
-    return { name: name || "Sin nombre", address: addr };
-  }
+  // address: ..., dir: ...
+  const m = t.match(/\b(address|direccion|dir)\s*[:=]\s*([^}\n\r]+)/i);
+  if (m) return { name:"Sin nombre", address: m[2].trim() };
 
-  // 5) "address: ...", "dir: ...", "direccion: ..."
-  const m = raw.match(/\b(address|dir|direccion)\s*[:=]\s*([^}\n\r]+)/i);
-  if (m) return { name: "Sin nombre", address: m[2].trim() };
+  // Si parece dirección, úsala
+  if (looksLikeAddress(t)) return { name:"Sin nombre", address: t };
 
-  // 6) Si parece claramente una dirección, úsala como address
-  if (looksLikeAddress(raw)) return { name: "Sin nombre", address: raw };
-
-  // 7) Probablemente un código 1D (tracking). Devolveremos "name" y que el usuario ponga dirección.
-  return { name: raw, address: "" };
+  // Probable tracking (Amazon/GLS…)
+  return { name: t, address: "" };
 }
 
-/* =========================
-   Geocodificación (OSM)
-   ========================= */
-async function geocodeAddress(q) {
-  const url =
-    "https://nominatim.openstreetmap.org/search?format=jsonv2&q=" + encodeURIComponent(q);
-  const res = await fetch(url, {
-    headers: {
-      Accept: "application/json",
-      "User-Agent": "TonyRutas/1.0 (capacitor)",
-    },
-  });
-  if (!res.ok) throw new Error("Error geocoding");
-  const data = await res.json();
-  if (!Array.isArray(data) || data.length === 0) throw new Error("Sin resultados");
-  const hit = data[0];
-  return {
-    lat: parseFloat(hit.lat),
-    lon: parseFloat(hit.lon),
-    displayName: hit.display_name,
-  };
-}
-
-/* =========================
-   Escáner universal (QR + 1D)
-   ========================= */
-function QROverlay({ onCancel, onResult }) {
+/* ====== Escáner Web (fallback) ====== */
+function WebScanner({ onCancel, onResult }) {
   const videoRef = useRef(null);
   const rafRef = useRef(0);
-  const [lastType, setLastType] = useState("");
 
-  const supportedDetector = useMemo(() => {
-    return "BarcodeDetector" in window ? window.BarcodeDetector : null;
-  }, []);
-
+  const supported = "BarcodeDetector" in window ? window.BarcodeDetector : null;
   const detectorRef = useRef(null);
 
   useEffect(() => {
-    let stream;
-    let disposed = false;
-
-    async function buildDetector() {
-      if (!supportedDetector) return null;
-
-      let formats = [
-        "qr_code",
-        "code_128",
-        "code_39",
-        "code_93",
-        "ean_13",
-        "ean_8",
-        "upc_a",
-        "upc_e",
-        "itf",
-        "codabar",
-        "data_matrix",
-        "pdf417",
-        "aztec",
-      ];
-
-      // Si el navegador soporta consulta:
-      try {
-        if (supportedDetector.getSupportedFormats) {
-          const sup = await supportedDetector.getSupportedFormats();
-          formats = formats.filter((f) => sup.includes(f));
-        }
-      } catch {}
-
-      return new supportedDetector({ formats });
-    }
-
+    let stream, disposed=false;
     async function start() {
       try {
         stream = await navigator.mediaDevices.getUserMedia({
-          video: {
-            facingMode: { ideal: "environment" },
-            width: { ideal: 1280 },
-            height: { ideal: 720 },
-          },
-          audio: false,
+          video:{ facingMode:{ideal:"environment"}, width:{ideal:1280}, height:{ideal:720} }, audio:false
         });
         if (disposed) return;
-
         videoRef.current.srcObject = stream;
         await videoRef.current.play();
 
-        if (!supportedDetector) {
-          alert("Este dispositivo no soporta lector nativo. Actualiza WebView/Chrome.");
-          onCancel();
-          return;
-        }
-
-        detectorRef.current = await buildDetector();
-        if (!detectorRef.current) {
-          alert("No se pudo inicializar el lector.");
-          onCancel();
-          return;
-        }
+        if (!supported) { alert("Sin soporte de lector en el navegador."); onCancel(); return; }
+        let formats = ["qr_code","code_128","code_39","code_93","ean_13","ean_8","upc_a","upc_e","itf","codabar","data_matrix","pdf417","aztec"];
+        try {
+          if (supported.getSupportedFormats) {
+            const sup = await supported.getSupportedFormats();
+            formats = formats.filter(f=>sup.includes(f));
+          }
+        } catch {}
+        detectorRef.current = new supported({ formats });
 
         const tick = async () => {
           if (disposed) return;
           try {
             const codes = await detectorRef.current.detect(videoRef.current);
-            if (codes && codes.length > 0) {
-              // Pick el más confiable
+            if (codes?.length) {
               const best = codes[0];
-              setLastType(best.format || "");
-              const raw = best.rawValue || "";
-              onResult({ raw, type: best.format || "unknown" });
+              onResult({ raw: best.rawValue || "", type: best.format || "unknown" });
               return;
             }
           } catch {}
@@ -198,335 +146,269 @@ function QROverlay({ onCancel, onResult }) {
         };
         rafRef.current = requestAnimationFrame(tick);
       } catch {
-        alert("No se pudo abrir la cámara. Revisa permisos de cámara.");
-        onCancel();
+        alert("No se pudo abrir la cámara (web)."); onCancel();
       }
     }
-
     start();
     return () => {
-      disposed = true;
+      disposed=true;
       cancelAnimationFrame(rafRef.current);
-      try {
-        stream && stream.getTracks().forEach((t) => t.stop());
-      } catch {}
+      try { stream?.getTracks().forEach(t=>t.stop()); } catch {}
     };
-  }, [supportedDetector, onCancel, onResult]);
+  }, [onCancel, onResult]);
 
   return (
-    <div style={styles.overlay}>
-      <div style={styles.scannerWrap}>
-        <video ref={videoRef} playsInline style={styles.video} />
-        <div style={styles.frame} />
-        <div style={styles.badge}>{lastType || "escaneando…"}</div>
-        <button onClick={onCancel} style={styles.closeBtn}>Cerrar</button>
+    <div style={st.overlay}>
+      <div style={st.scanBox}>
+        <video ref={videoRef} playsInline style={st.video}/>
+        <div style={st.frame}/>
+        <button onClick={onCancel} style={st.close}>Cerrar</button>
       </div>
     </div>
   );
 }
 
-/* =========================
-   App principal
-   ========================= */
-export default function App() {
+/* ====== App ====== */
+export default function App(){
+  const [defaultCity, setDefaultCity] = useState("Benicarló, Castellón, España");
+
   const [originText, setOriginText] = useState("");
-  const [originLL, setOriginLL] = useState(null);
+  const [originLL, setOriginLL]   = useState(null);
 
   const [name, setName] = useState("");
-  const [addressText, setAddressText] = useState("");
+  const [addr, setAddr] = useState("");
   const [note, setNote] = useState("");
-  const [photoDataUrl, setPhotoDataUrl] = useState("");
+  const [photo, setPhoto] = useState("");
 
-  const [items, setItems] = useState([]);
-  const [distanceKm, setDistanceKm] = useState(0);
+  const [list, setList] = useState([]);
+  const [km, setKm] = useState(0);
 
-  const [qrOpen, setQrOpen] = useState(false);
+  const [scanning, setScanning] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [msg, setMsg] = useState("");
+  const isNative = Capacitor.isNativePlatform();
 
-  // Distancia estimada
+  // Distancia
   useEffect(() => {
-    (async () => {
-      try {
-        if (!originLL || items.length === 0) {
-          setDistanceKm(0);
-          return;
-        }
-        let km = 0;
-        let prev = originLL;
-        for (const it of items) {
-          if (!it.lat || !it.lon) {
-            setDistanceKm(0);
-            return;
-          }
-          km += haversine([prev.lat, prev.lon], [it.lat, it.lon]);
-          prev = { lat: it.lat, lon: it.lon };
-        }
-        setDistanceKm(Math.round(km * 10) / 10);
-      } catch {
-        setDistanceKm(0);
-      }
-    })();
-  }, [originLL, items]);
+    if (!originLL || list.length===0) { setKm(0); return; }
+    let sum=0, prev=originLL;
+    for (const it of list) {
+      if (!it.lat || !it.lon) { setKm(0); return; }
+      sum += haversine([prev.lat, prev.lon], [it.lat, it.lon]);
+      prev = { lat: it.lat, lon: it.lon };
+    }
+    setKm(Math.round(sum*10)/10);
+  }, [originLL, list]);
 
   async function setOrigin() {
     if (!originText.trim()) return;
-    setBusy(true); setMsg("Geocodificando origen…");
+    setBusy(true);
     try {
-      const g = await geocodeAddress(originText.trim());
-      setOriginLL({ lat: g.lat, lon: g.lon, displayName: g.displayName });
-      setMsg("Origen definido ✅");
+      const g = await smartGeocode(originText.trim(), defaultCity);
+      setOriginLL(g);
     } catch {
-      alert("No pude localizar ese origen. Prueba con ciudad/CP.");
-    } finally {
-      setBusy(false);
+      alert("No pude localizar ese origen. Añade ciudad/CP.");
+    } finally { setBusy(false); }
+  }
+
+  async function addItem() {
+    if (!addr.trim()) { alert("Falta dirección"); return; }
+    setBusy(true);
+    try {
+      const g = await smartGeocode(addr.trim(), defaultCity);
+      const id = Date.now().toString(36)+Math.random().toString(36).slice(2,6);
+      setList(x => [...x, { id, name: name.trim()||"Sin nombre", address: addr.trim(), displayName: g.displayName, lat:g.lat, lon:g.lon, note: note.trim(), photo }]);
+      setName(""); setAddr(""); setNote(""); setPhoto("");
+    } catch {
+      alert("No pude localizar esa dirección. Prueba añadiendo ciudad/CP o ajusta la ciudad por defecto.");
+    } finally { setBusy(false); }
+  }
+
+  // Escáner universal (nativo → MLKit; web → BarcodeDetector)
+  async function scanCode(){
+    if (isNative) {
+      try {
+        const ok = await BarcodeScanner.isSupported();
+        if (!ok) throw new Error("not supported");
+        const perm = await BarcodeScanner.requestPermissions();
+        if (perm.camera !== "granted") { alert("Permiso de cámara denegado"); return; }
+        const res = await BarcodeScanner.scan();
+        if (res?.barcodes?.length) {
+          const raw = res.barcodes[0].rawValue || "";
+          const parsed = parseScannedText(raw);
+          if (parsed.address) { setAddr(parsed.address); }
+          if (parsed.name)    { setName(parsed.name); }
+          if (!parsed.address) alert("Código detectado (seguimiento). Escanea un QR con dirección o usa OCR desde foto.");
+        } else {
+          alert("No se detectó ningún código");
+        }
+      } catch {
+        // Fallback a web
+        setScanning(true);
+      }
+    } else {
+      setScanning(true);
     }
   }
 
-  async function addPackage() {
-    if (!addressText.trim()) {
-      alert("Escribe/escanea una dirección");
-      return;
-    }
-    setBusy(true); setMsg("Geocodificando paquete…");
-    try {
-      const g = await geocodeAddress(addressText.trim());
-      const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-      setItems((old) => [
-        ...old,
-        {
-          id,
-          name: name.trim() || "Sin nombre",
-          address: addressText.trim(),
-          displayName: g.displayName,
-          lat: g.lat,
-          lon: g.lon,
-          note: note.trim(),
-          photo: photoDataUrl || "",
-        },
-      ]);
-      setName("");
-      setAddressText("");
-      setNote("");
-      setPhotoDataUrl("");
-      setMsg("Paquete añadido ✅");
-    } catch {
-      alert("No pude localizar esa dirección. Prueba con ciudad/CP.");
-    } finally {
-      setBusy(false);
-    }
+  function onWebScanResult({ raw }){
+    const parsed = parseScannedText(raw);
+    if (parsed.address) setAddr(parsed.address);
+    if (parsed.name) setName(parsed.name);
+    if (!parsed.address) alert("Código detectado (seguimiento). Escanea un QR con dirección o usa OCR desde foto.");
+    setScanning(false);
   }
 
-  async function takePhoto() {
+  // OCR desde foto de etiqueta
+  async function ocrFromPhoto(){
     try {
       const p = await Camera.getPhoto({
         source: CameraSource.Camera,
         direction: CameraDirection.Rear,
-        resultType: CameraResultType.DataUrl,
-        quality: 70,
-        allowEditing: false,
+        resultType: CameraResultType.Uri,
+        quality: 80
       });
-      if (p && p.dataUrl) setPhotoDataUrl(p.dataUrl);
-    } catch {
-      alert("No se pudo hacer la foto. Revisa permisos de cámara.");
+      if (!p || !p.path) { alert("No se obtuvo imagen"); return; }
+
+      const perms = await TextRecognition.requestPermissions();
+      if (perms.camera !== "granted" && perms.photos !== "granted") {
+        // algunos dispositivos devuelven "limited" o similar: intentamos igualmente
+      }
+      const { recognizedText } = await TextRecognition.recognizeImage({ path: p.path });
+      const text = recognizedText || "";
+      if (!text.trim()) { alert("No se leyó texto en la etiqueta"); return; }
+
+      // Heurística simple: buscar líneas útiles
+      const lines = text.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
+
+      // Nombre: primera línea “limpia” que no parezca dirección
+      const probableName = lines.find(L => !looksLikeAddress(L) && !/^\d+$/.test(L)) || "Sin nombre";
+
+      // Dirección:  línea con palabras de calle o CP
+      let addrLine = lines.find(L => looksLikeAddress(L)) || "";
+      // Si no está el CP en esa línea, intenta añadir la línea siguiente que tenga 5 dígitos
+      const cpLine = lines.find(L => /\b\d{5}\b/.test(L));
+      if (cpLine && !addrLine.includes(cpLine)) addrLine = addrLine ? `${addrLine}, ${cpLine}` : cpLine;
+
+      if (!addrLine) {
+        alert("No pude extraer una dirección clara. Rellena a mano o vuelve a intentar con otra foto.");
+        setName(probableName);
+        return;
+      }
+      setName(probableName);
+      setAddr(addrLine);
+      setPhoto(p.webPath || "");
+    } catch (e) {
+      alert("No se pudo hacer OCR. Revisa permisos de cámara/almacenamiento.");
     }
   }
 
-  function removeItem(id) {
-    setItems((old) => old.filter((x) => x.id !== id));
-  }
-
-  function optimizeOrder() {
-    if (!originLL || items.length <= 2) return;
-    const rem = [...items];
-    const out = [];
-    let cur = originLL;
-    while (rem.length) {
-      let bestIdx = 0;
-      let bestDist = Infinity;
-      rem.forEach((it, i) => {
-        const d = haversine([cur.lat, cur.lon], [it.lat, it.lon]);
-        if (d < bestDist) { bestDist = d; bestIdx = i; }
+  function optimize() {
+    if (!originLL || list.length<2) return;
+    const rem=[...list], out=[]; let cur=originLL;
+    while(rem.length){
+      let iBest=0, dBest=Infinity;
+      rem.forEach((it,i)=>{
+        const d = haversine([cur.lat,cur.lon],[it.lat,it.lon]);
+        if (d<dBest){ dBest=d; iBest=i; }
       });
-      const next = rem.splice(bestIdx, 1)[0];
+      const next = rem.splice(iBest,1)[0];
       out.push(next);
       cur = { lat: next.lat, lon: next.lon };
     }
-    setItems(out);
+    setList(out);
   }
 
-  function googleMapsDirLink(origin, stops) {
-    const originParam = `${origin.lat},${origin.lon}`;
-    const dest = stops[stops.length - 1];
-    const destParam = `${dest.lat},${dest.lon}`;
-    const waypoints = stops.slice(0, -1).map((p) => `${p.lat},${p.lon}`).join("|");
-    const wpParam = waypoints ? `&waypoints=${encodeURIComponent(waypoints)}` : "";
-    return `https://www.google.com/maps/dir/?api=1&origin=${encodeURIComponent(originParam)}&destination=${encodeURIComponent(destParam)}${wpParam}`;
-  }
-
-  function openInGoogleMaps() {
-    if (!originLL || items.length === 0) return;
-    const MAX = 9;
-    const chunk = items.slice(0, Math.min(items.length, MAX));
-    const url = googleMapsDirLink(originLL, chunk);
-    window.open(url, "_blank");
-  }
-
-  function onScanResult({ raw, type }) {
-    const info = parseQRText(raw);
-
-    if (!info) {
-      alert("No se pudo interpretar el código.");
-      setQrOpen(false);
-      return;
-    }
-
-    // Si no hay address y parece tracking (1D)
-    if (!info.address) {
-      setName(info.name || raw || "Seguimiento");
-      alert("Código detectado (probable seguimiento). Añade la dirección manual o escanéala en otro código.");
-    } else {
-      setName(info.name || "Sin nombre");
-      setAddressText(info.address);
-    }
-
-    setQrOpen(false);
+  function openMaps(){
+    if (!originLL || list.length===0) return;
+    const MAX=9, stops=list.slice(0,Math.min(list.length,MAX));
+    const originParam=`${originLL.lat},${originLL.lon}`;
+    const dest=stops[stops.length-1];
+    const destParam=`${dest.lat},${dest.lon}`;
+    const way = stops.slice(0,-1).map(p=>`${p.lat},${p.lon}`).join("|");
+    const wp = way? `&waypoints=${encodeURIComponent(way)}`:"";
+    const url=`https://www.google.com/maps/dir/?api=1&origin=${encodeURIComponent(originParam)}&destination=${encodeURIComponent(destParam)}${wp}`;
+    window.open(url,"_blank");
   }
 
   return (
-    <div style={styles.page}>
-      <header style={styles.header}>
-        <h1 style={{ margin: 0 }}>Tony Rutas (Capacitor)</h1>
-        <div style={{ color: "#6b7280" }}>
-          Origen + paquetes, <b>fotos</b>, <b>notas</b>, escáner <b>QR/código de barras</b> y <b>optimización de ruta</b>.
+    <div style={st.page}>
+      <h1 style={{margin:0}}>Tony Rutas (Capacitor)</h1>
+      <div style={{color:"#6b7280"}}>Origen + paquetes, <b>fotos</b>, <b>notas</b>, escáner <b>QR/código de barras</b> y OCR.</div>
+
+      <div style={st.card}>
+        <div style={{display:"flex", gap:8, marginBottom:8}}>
+          <input style={st.input} placeholder="Dirección del almacén / salida"
+            value={originText} onChange={e=>setOriginText(e.target.value)} />
+          <button style={st.btnPrimary} onClick={setOrigin} disabled={busy}>Definir Origen</button>
         </div>
-      </header>
-
-      {/* Origen */}
-      <section style={styles.card}>
-        <div style={{ display: "flex", gap: 8 }}>
-          <input
-            style={styles.input}
-            placeholder="Dirección del almacén / salida"
-            value={originText}
-            onChange={(e) => setOriginText(e.target.value)}
-          />
-          <button style={styles.btnPrimary} onClick={setOrigin} disabled={busy}>Definir Origen</button>
+        <div style={{display:"flex", gap:8}}>
+          <input style={st.input} placeholder="Ciudad/CP por defecto (fallback geocoder)"
+            value={defaultCity} onChange={e=>setDefaultCity(e.target.value)} />
         </div>
-        {originLL && <div style={{ marginTop: 8, color: "#16a34a" }}>✅ {originLL.displayName}</div>}
-      </section>
+      </div>
 
-      {/* Añadir paquete */}
-      <section style={styles.card}>
-        <h2 style={styles.h2}>Añadir paquete</h2>
-
-        <input
-          style={styles.input}
-          placeholder="Nombre del paquete / Seguimiento"
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-        />
-
-        <div style={{ display: "flex", gap: 8 }}>
-          <input
-            style={styles.input}
-            placeholder="Dirección completa"
-            value={addressText}
-            onChange={(e) => setAddressText(e.target.value)}
-          />
+      <div style={st.card}>
+        <h3 style={{marginTop:0}}>Añadir paquete</h3>
+        <input style={st.input} placeholder="Nombre / Seguimiento" value={name} onChange={e=>setName(e.target.value)} />
+        <div style={{display:"flex", gap:8, marginTop:8}}>
+          <input style={st.input} placeholder="Dirección completa" value={addr} onChange={e=>setAddr(e.target.value)} />
         </div>
-
-        <textarea
-          style={styles.textarea}
-          placeholder="Nota (opcional)"
-          value={note}
-          onChange={(e) => setNote(e.target.value)}
-          rows={3}
-        />
-
-        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-          <button style={styles.btnPrimary} onClick={addPackage} disabled={busy}>Añadir</button>
-          <button style={styles.btn} onClick={() => setQrOpen(true)}>📷 Escanear QR / Código</button>
-          <button style={styles.btn} onClick={takePhoto}>📸 Foto del paquete</button>
-          <button style={styles.btnGhost} onClick={() => { setName(""); setAddressText(""); setNote(""); setPhotoDataUrl(""); }}>Vaciar campos</button>
+        <textarea style={{...st.input, height:72, marginTop:8}} placeholder="Nota (opcional)" value={note} onChange={e=>setNote(e.target.value)} />
+        <div style={{display:"flex", gap:8, marginTop:8, flexWrap:"wrap"}}>
+          <button style={st.btnPrimary} onClick={addItem} disabled={busy}>Añadir</button>
+          <button style={st.btn} onClick={scanCode}>📷 Escanear QR / código</button>
+          <button style={st.btn} onClick={ocrFromPhoto}>📸 Leer datos desde foto (OCR)</button>
+          <button style={st.btnGhost} onClick={()=>{setName("");setAddr("");setNote("");setPhoto("");}}>Vaciar campos</button>
         </div>
+        {photo && <img alt="prev" src={photo} style={{marginTop:8, width:120, height:120, objectFit:"cover", borderRadius:12, border:"1px solid #e5e7eb"}}/>}
+      </div>
 
-        {msg && <div style={{ marginTop: 8, color: "#2563eb" }}>{msg}</div>}
-      </section>
-
-      {/* Foto previa */}
-      {photoDataUrl && (
-        <section style={styles.card}>
-          <div style={{ fontWeight: 600, marginBottom: 8 }}>Foto previa</div>
-          <img alt="prev" src={photoDataUrl} style={{ width: 160, height: 160, objectFit: "cover", borderRadius: 12, border: "1px solid #e5e7eb" }} />
-        </section>
-      )}
-
-      {/* Acciones de ruta */}
-      <section style={styles.card}>
-        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-          <button style={styles.btnPrimary} onClick={openInGoogleMaps} disabled={!originLL || items.length === 0}>🚀 Abrir en Google Maps</button>
-          <button style={styles.btn} onClick={optimizeOrder} disabled={!originLL || items.length < 2}>⚡ Optimizar orden</button>
-          <button style={styles.btnGhost} onClick={() => setItems([])} disabled={items.length === 0}>Deshacer</button>
+      <div style={st.card}>
+        <div style={{display:"flex", gap:8, flexWrap:"wrap"}}>
+          <button style={st.btnPrimary} onClick={openMaps} disabled={!originLL || list.length===0}>🚀 Abrir en Google Maps</button>
+          <button style={st.btn} onClick={optimize} disabled={!originLL || list.length<2}>⚡ Optimizar orden</button>
+          <button style={st.btnGhost} onClick={()=>setList([])} disabled={list.length===0}>Deshacer</button>
         </div>
-        <div style={{ marginTop: 8, color: "#111827" }}>
-          Distancia estimada: <b>{distanceKm} km</b>
-        </div>
-      </section>
+        <div style={{marginTop:8}}>Distancia estimada: <b>{km} km</b></div>
+      </div>
 
-      {/* Lista */}
-      <section style={styles.card}>
-        <h2 style={styles.h2}>Paquetes ({items.length})</h2>
-        {items.length === 0 ? (
-          <div style={{ color: "#6b7280" }}>Sin paquetes.</div>
-        ) : (
-          <div style={{ display: "grid", gap: 8 }}>
-            {items.map((it, idx) => (
-              <div key={it.id} style={styles.item}>
-                <div style={{ flex: 1 }}>
-                  <div style={{ fontWeight: 700 }}>{idx + 1}. {it.name}</div>
-                  <div style={{ color: "#374151" }}>{it.address}</div>
-                  <div style={{ color: "#6b7280", fontSize: 12 }}>{it.displayName}</div>
-                  {it.note && <div style={{ marginTop: 4, fontStyle: "italic", color: "#4b5563" }}>📝 {it.note}</div>}
+      <div style={st.card}>
+        <h3 style={{marginTop:0}}>Paquetes ({list.length})</h3>
+        {list.length===0 ? <div style={{color:"#6b7280"}}>Sin paquetes.</div> : (
+          <div style={{display:"grid", gap:8}}>
+            {list.map((it, i)=>(
+              <div key={it.id} style={st.item}>
+                <div style={{flex:1}}>
+                  <div style={{fontWeight:700}}>{i+1}. {it.name}</div>
+                  <div>{it.address}</div>
+                  <div style={{fontSize:12, color:"#6b7280"}}>{it.displayName}</div>
+                  {it.note && <div style={{fontStyle:"italic", color:"#4b5563"}}>📝 {it.note}</div>}
                 </div>
-                {it.photo && (
-                  <img alt="f" src={it.photo} style={{ width: 64, height: 64, objectFit: "cover", borderRadius: 10, border: "1px solid #e5e7eb" }} />
-                )}
-                <button onClick={() => removeItem(it.id)} style={styles.btnDanger}>Eliminar</button>
+                {it.photo && <img alt="" src={it.photo} style={{width:56, height:56, borderRadius:10, objectFit:"cover", border:"1px solid #e5e7eb"}}/>}
               </div>
             ))}
           </div>
         )}
-      </section>
+      </div>
 
-      {qrOpen && <QROverlay onCancel={() => setQrOpen(false)} onResult={onScanResult} />}
+      {scanning && <WebScanner onCancel={()=>setScanning(false)} onResult={onWebScanResult} />}
     </div>
   );
 }
 
-/* =========================
-   Estilos
-   ========================= */
-const styles = {
-  page: { maxWidth: 900, margin: "0 auto", padding: 16 },
-  header: { padding: "12px 0 8px 0" },
-  card: { background: "#fff", border: "1px solid #e5e7eb", borderRadius: 16, padding: 16, marginBottom: 12 },
-  input: { flex: 1, border: "1px solid #d1d5db", borderRadius: 10, padding: "10px 12px", outline: "none" },
-  textarea: { width: "100%", border: "1px solid #d1d5db", borderRadius: 10, padding: "10px 12px", outline: "none" },
-  btnPrimary: { background: "#2563eb", color: "#fff", border: "none", borderRadius: 10, padding: "10px 14px", cursor: "pointer" },
-  btn: { background: "#f3f4f6", color: "#111827", border: "1px solid #e5e7eb", borderRadius: 10, padding: "10px 14px", cursor: "pointer" },
-  btnGhost: { background: "transparent", color: "#2563eb", border: "1px solid #bfdbfe", borderRadius: 10, padding: "10px 14px", cursor: "pointer" },
-  btnDanger: { background: "#fee2e2", color: "#991b1b", border: "1px solid #fecaca", borderRadius: 10, padding: "8px 12px", cursor: "pointer", marginLeft: 8 },
-  h2: { margin: 0, marginBottom: 12, fontSize: 20 },
-  item: { display: "flex", alignItems: "center", gap: 12, border: "1px solid #e5e7eb", borderRadius: 12, padding: 12 },
+/* ====== Estilos ====== */
+const st = {
+  page: { maxWidth:900, margin:"0 auto", padding:16 },
+  card: { background:"#fff", border:"1px solid #e5e7eb", borderRadius:16, padding:16, marginTop:12 },
+  input:{ flex:1, border:"1px solid #d1d5db", borderRadius:10, padding:"10px 12px", outline:"none" },
+  btnPrimary:{ background:"#2563eb", color:"#fff", border:"none", borderRadius:10, padding:"10px 14px", cursor:"pointer" },
+  btn:{ background:"#f3f4f6", color:"#111827", border:"1px solid #e5e7eb", borderRadius:10, padding:"10px 14px", cursor:"pointer" },
+  btnGhost:{ background:"transparent", color:"#2563eb", border:"1px solid #bfdbfe", borderRadius:10, padding:"10px 14px", cursor:"pointer" },
+  item:{ display:"flex", alignItems:"center", gap:12, border:"1px solid #e5e7eb", borderRadius:12, padding:12 },
 
-  // Escáner
-  overlay: { position: "fixed", inset: 0, background: "rgba(0,0,0,0.85)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 9999, padding: 12 },
-  scannerWrap: { position: "relative", width: "min(100%, 720px)", aspectRatio: "16/9", background: "#000", borderRadius: 16, overflow: "hidden", border: "1px solid #334155" },
-  video: { width: "100%", height: "100%", objectFit: "cover" },
-  frame: { position: "absolute", inset: "10%", border: "3px solid rgba(255,255,255,0.9)", borderRadius: 16, boxShadow: "0 0 0 100vmax rgba(0,0,0,0.25) inset" },
-  closeBtn: { position: "absolute", right: 12, bottom: 12, background: "#111827", color: "#fff", border: "1px solid #374151", borderRadius: 10, padding: "10px 12px", cursor: "pointer" },
-  badge: { position: "absolute", left: 12, top: 12, background: "rgba(17,24,39,0.8)", color: "#fff", border: "1px solid #4b5563", borderRadius: 10, padding: "6px 10px", fontSize: 12, textTransform: "uppercase", letterSpacing: 0.5 },
+  overlay:{ position:"fixed", inset:0, background:"rgba(0,0,0,0.85)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:9999, padding:12 },
+  scanBox:{ position:"relative", width:"min(100%, 720px)", aspectRatio:"16/9", background:"#000", borderRadius:16, overflow:"hidden", border:"1px solid #334155" },
+  video:{ width:"100%", height:"100%", objectFit:"cover" },
+  frame:{ position:"absolute", inset:"10%", border:"3px solid rgba(255,255,255,0.9)", borderRadius:16, boxShadow:"0 0 0 100vmax rgba(0,0,0,0.25) inset" },
+  close:{ position:"absolute", right:12, bottom:12, background:"#111827", color:"#fff", border:"1px solid #374151", borderRadius:10, padding:"10px 12px", cursor:"pointer" },
 };
-
-
